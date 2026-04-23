@@ -30,3 +30,7 @@ native-tls = "0.2.11"
 clap = { version = "4.1.8", features = ["derive", "env"] }
 dotenv = "0.15.0"
 indicatif = "0.17.2"
+async-trait = "0.1.89"
+thiserror = "1.0.65"
+console = "0.15.8"
+trust-dns-resolver = "0.22.0"

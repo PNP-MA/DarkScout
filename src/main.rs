@@ -1,144 +1,149 @@
 use itertools::Itertools;
-use clap::Parser;
-use dotenv::dotenv;
+use futures::future::join_all;
+use indicatif::MultiProgress;
+use console::style;
+use std::collections::HashSet;
 
-mod alienvault;
-mod anubis;
-mod crtsh;
-mod hackertarget;
-mod threatminer;
-
-mod structs;
+mod plugins;
+mod models;
 mod utils;
-mod files;
+mod io;
+mod errors;
+mod browser;
+mod args;
+mod bruteforce;
 
-#[derive(Parser, Debug)]
-#[command(author, version, about)]
-
-pub struct Arguments {
-
-    #[arg(short, long, env("TARGET_URL"),  default_value = "https://hackthissite.org/")]
-    pub target_url: String,
-
-    #[arg(short, long, env("OUTPUT_FILE"))]
-    pub output_file: Option<String>
-}
-
-impl Arguments {
-    pub fn from_env_and_args() -> Self{
-        dotenv().ok();
-        Self::parse()
-    }
-}
-
-/// Prints the opening title of darkscout
-fn print_opening() {
-    let s = format!(
-        "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
-        r#" _____             _     _____                 _       "#,
-        r#" |  __ \           | |   / ____|               | |     "#,
-        r#" | |  | | __ _ _ __| | _| (___   ___ ___  _   _| |_    "#,
-        r#" | |  | |/ _` | '__| |/ /\___ \ / __/ _ \| | | | __|   "#,
-        r#" | |__| | (_| | |  |   < ____) | (_| (_) | |_| | |_    "#,
-        r#" |_____/ \__,_|_|  |_|\_\_____/ \___\___/ \__,_|\__|   "#,
-        r#"                                                       "#,
-        r#" A Simple, Modern Subdomain Enumerator Written In Rust "#,
-    );
-    println!("{}", s);
-    println!();
-    let info = format!(
-        "{}\n{}\n{}\n{}",
-        r#"*****************************************************"#,
-        r#"| https://github.com/DarkSuite/DarkScout            |"#,
-        r#"| Welcome To The Dark Side...                       |"#,
-        r#"*****************************************************"#
-    );
-    println!("{}", info);
-}
+use plugins::PluginRegistry;
+use args::Arguments;
+use bruteforce::BruteForceEngine;
+use utils::{print_step, print_error, print_success, print_opening, list_all_plugins, LOOKING_GLASS, SPARKLE};
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> anyhow::Result<()> {
+    let args = Arguments::from_env_and_args();
+    let registry = PluginRegistry::new();
 
+    if args.list {
+        print_opening();
+        list_all_plugins(&registry);
+        return Ok(());
+    }
+
+    let raw_target = match args.target_url {
+        Some(target) => target,
+        None => {
+            print_opening();
+            return Ok(());
+        }
+    };
+
+    // Print opening only for actual execution
     print_opening();
 
     let start = std::time::Instant::now();
-
-    let raw_target = Arguments::from_env_and_args().target_url; 
-
     let cleaned_target = utils::sanitize_target_url_string(raw_target);  
 
-    println!("\n[darkscout]> Starting subdomain enumeration...\n");
-    println!("[darkscout]> Be patient as this can take a while!\n");
-    println!("|***************************************************|\n");
+    print_step(&format!("{} Target: {}", LOOKING_GLASS, style(&cleaned_target).bold().yellow()));
+    println!();
 
-    let (
+    let mut all_found_subdomains = Vec::new();
+    let mp = MultiProgress::new();
 
-        alienvault, 
-        anubis, 
-        crtsh, 
-        hackertarget,  
-        threatminer
+    // --- PHASE 1: OSINT Plugins ---
+    // Logic: 
+    // 1. If plugins are explicitly requested (-p), run them.
+    // 2. If no plugins are requested AND no wordlist is provided, run enabled plugins.
+    // 3. If wordlist is provided (-w) AND no plugins are requested (-p), skip OSINT.
+    let engines = if let Some(plugin_names) = &args.plugins {
+        registry.get_by_names(plugin_names)
+    } else if args.wordlist.is_none() {
+        registry.get_enabled()
+    } else {
+        Vec::new() // Skip OSINT if wordlist provided without -p
+    };
 
-        ) = futures::join!(
+    if !engines.is_empty() {
+        let browser = browser::Browser::new();
+        let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(3)); 
+        
+        let mut ran_plugins = HashSet::new();
+        let mut futures = Vec::new();
+
+        for engine in engines {
+            let name = engine.name().to_string();
+            if ran_plugins.contains(&name) { continue; }
+            ran_plugins.insert(name);
+
+            let sem = semaphore.clone();
+            let target = cleaned_target.clone();
+            let mp_ref = &mp;
+            let br = &browser;
             
-        alienvault::get_alienvault_subdomains(&cleaned_target),
-        anubis::get_anubis_subdomains(&cleaned_target),
-        crtsh::get_crt_domains(&cleaned_target),
-        hackertarget::get_hackertarget_domains(&cleaned_target),
-        threatminer::get_threatminer_subdomains(&cleaned_target),
-    );
+            futures.push(async move {
+                let _permit = sem.acquire().await.ok();
+                engine.run(&target, mp_ref, br).await
+            });
+        }
+        
+        let results = join_all(futures).await;
+        for res in results {
+            if let Ok(subs) = res {
+                all_found_subdomains.extend(subs);
+            }
+        }
+    }
 
-    let duration = start.elapsed();
+    // --- PHASE 2: Brute Force ---
+    if let Some(wordlist_paths) = &args.wordlist {
+        let words = io::read_wordlists(wordlist_paths)?;
+        if !words.is_empty() {
+            let brute_engine = BruteForceEngine::new(args.concurrency);
+            let brute_results = brute_engine.run(&cleaned_target, words, &mp).await;
+            all_found_subdomains.extend(brute_results);
+        } else {
+            print_error("Wordlist is empty or no valid files found.");
+        }
+    }
 
-    let subdomains: Vec<_> = alienvault
-        .iter()
-        .flatten()
-        .chain(anubis.iter().flatten())
-        .chain(crtsh.iter().flatten())
-        .chain(hackertarget.iter().flatten())
-        .chain(threatminer.iter().flatten())
-        .unique_by(|s| &s.url)
+    // Deduplicate and normalize
+    let subdomains: Vec<_> = all_found_subdomains
+        .into_iter()
+        .map(|mut s| {
+            s.url = s.url.trim().to_lowercase();
+            s
+        })
+        .filter(|s| !s.url.is_empty() && s.url.contains(&cleaned_target))
+        .unique_by(|s| s.url.clone())
+        .sorted_by(|a, b| a.url.cmp(&b.url))
         .collect();
 
+    let duration = start.elapsed();
     let total = subdomains.len();
 
-    let sub_clone = subdomains.clone();
+    println!();
+    print_step(&format!("{} Found {} unique subdomains", SPARKLE, style(total).bold().green()));
+    println!();
 
-    println!("\n");
+    if total > 0 {
+        for sub in &subdomains {
+            println!("  {} {}", style("→").dim(), sub.url);
+        }
+    }
 
-    println!("[darkscout]> Here are your domains...\n");
-    println!("|***************************************************|\n");
-
-    for sub in subdomains.into_iter() {
-        println!("{}", sub.url);
-
-    } 
-
-    if let Some(output_file) = Arguments::from_env_and_args().output_file {
-        // do something with the output_file argument
-
-        files::create_output_dir()?;
-
-        files::create_output_file(&output_file, &sub_clone)?;
-        println!("\n[darkscout]> Output successfully writen.");
-
-        println!("\n|***************************************************|");
-
-        println!(
-                "\n[darkscout]> Successfully scraped {} subdomains from {} in {:?}",
-                total, cleaned_target, duration
-            );
-
-    } else {
-
-    println!("\n|***************************************************|");
-
-    println!(
-        "\n[darkscout]> Successfully scraped {} subdomains from {} in {:?}",
-        total, cleaned_target, duration
-    );
+    if let Some(output_file) = args.output_file {
+        if let Err(e) = io::create_output_dir() {
+            print_error(&format!("Failed to create output directory: {}", e));
+        } else if let Err(e) = io::create_output_file(&output_file, &subdomains) {
+            print_error(&format!("Failed to write output file: {}", e));
+        } else {
+            println!();
+            print_success(&format!("Results saved to {}", style(format!("output/{}", output_file)).underlined()));
+        }
+    }
 
     println!();
-};
+    print_step(&format!("Finished in {}", style(format!("{:?}", duration)).cyan()));
+    println!();
+
     Ok(())
 }
